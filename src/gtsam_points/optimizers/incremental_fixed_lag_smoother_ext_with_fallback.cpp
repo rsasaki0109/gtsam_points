@@ -41,6 +41,11 @@ IncrementalFixedLagSmootherExtWithFallback::Result IncrementalFixedLagSmootherEx
   }
 
   values.insert(newTheta);
+  for (const auto& key_val : newTheta) {
+    if (!original_values.exists(key_val.key)) {
+      original_values.insert(key_val.key, key_val.value);
+    }
+  }
   for (auto& stamp : timestamps) {
     stamps[stamp.first] = stamp.second;
     current_stamp = std::max(current_stamp, stamp.second);
@@ -151,6 +156,9 @@ void IncrementalFixedLagSmootherExtWithFallback::update_fallback_state() {
     }
 
     values.erase(key);
+    if (original_values.exists(key)) {
+      original_values.erase(key);
+    }
   }
 
   for (auto itr = stamps.begin(); itr != stamps.end();) {
@@ -295,7 +303,15 @@ void IncrementalFixedLagSmootherExtWithFallback::fallback_smoother() const {
   this->factors = new_factors;
 
   const auto add_fixation_factor = [&](gtsam::NonlinearFactorGraph& graph, const gtsam::Values::ConstKeyValuePair& value, const std::pair<char, int>& var_type) {
-    const gtsam::Value& fixation_value = value.value;
+    // When the force-fallback cadence is enabled, switch the fixation target to original_values
+    // (schedule-independent snapshot of input theta). This prevents timing-dependent mutations of
+    // `values` by calculateEstimate(key) from leaking into the fallback result and makes successive
+    // fallbacks reproducible. When force-fallback is off, keep the legacy behavior (value.value)
+    // for backward compatibility — callers that trigger only on actual ILS throws expect the
+    // fixation target to track the current optimizer estimate.
+    const bool use_original = (force_fallback_interval > 0);
+    const auto original_itr = use_original ? original_values.find(value.key) : original_values.end();
+    const gtsam::Value& fixation_value = (original_itr != original_values.end()) ? original_itr->value : value.value;
     switch (var_type.second) {
       case 0:
         graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(

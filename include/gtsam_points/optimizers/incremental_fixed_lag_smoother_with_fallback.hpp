@@ -78,6 +78,7 @@ private:
 private:
   double current_stamp;
   mutable gtsam::Values values;
+  mutable gtsam::Values original_values;  // insert-only snapshot of input theta (no mutation by calculateEstimate)
   mutable gtsam::NonlinearFactorGraph factors;
   mutable std::atomic_bool fallback_happend;
   std::unordered_map<gtsam::Key, std::vector<gtsam::NonlinearFactor::shared_ptr>> factor_map;
