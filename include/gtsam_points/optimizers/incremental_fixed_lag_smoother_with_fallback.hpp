@@ -14,6 +14,8 @@ public:
 
   void set_fix_variable_types(const std::vector<std::pair<char, int>>& var_types) { fix_variable_types = var_types; }
 
+  void set_force_fallback_interval(int interval) { force_fallback_interval = interval; }
+
   Result update(
     const gtsam::NonlinearFactorGraph& newFactors = gtsam::NonlinearFactorGraph(),
     const gtsam::Values& newTheta = gtsam::Values(),  //
@@ -40,14 +42,25 @@ public:
       std::cerr << "       : " << e.what() << std::endl;
 
       fallback_smoother();
+      try {
+        const auto& value = smoother->calculateEstimate(key);
+        auto found = values.find(key);
+        if (found != values.end()) {
+          const_cast<gtsam::Value&>(found->value) = value;  // Bad practice!!
+        }
 
-      const auto& value = smoother->calculateEstimate(key);
-      auto found = values.find(key);
-      if (found != values.end()) {
-        const_cast<gtsam::Value&>(found->value) = value;  // Bad practice!!
+        return value.cast<VALUE>();
+      } catch (std::exception& fallback_error) {
+        std::cerr << "warning: fallback calculateEstimate still failed, using cached value!!" << std::endl;
+        std::cerr << "       : " << fallback_error.what() << std::endl;
+
+        auto found = values.find(key);
+        if (found == values.end()) {
+          throw;
+        }
+
+        return found->value.cast<VALUE>();
       }
-
-      return value.cast<VALUE>();
     }
   }
 
@@ -72,6 +85,9 @@ private:
 
   mutable std::unique_ptr<IncrementalFixedLagSmootherExt> smoother;
 
-  std::vector<std::pair<char, int>> fix_variable_types;  // (chr, type)  type: 0=Pose3, 1=Point3
+  std::vector<std::pair<char, int>> fix_variable_types;  // (chr, type)  type: 0=Pose3, 1=Vector3, 2=imuBias::ConstantBias
+
+  int force_fallback_interval = 0;  // 0 = disabled; otherwise fire fallback every N updates for determinism
+  mutable int update_count = 0;
 };
 }  // namespace gtsam_points
