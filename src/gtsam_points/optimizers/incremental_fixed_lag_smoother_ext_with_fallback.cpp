@@ -88,6 +88,10 @@ IncrementalFixedLagSmootherExtWithFallback::Result IncrementalFixedLagSmootherEx
 }
 
 gtsam::Values IncrementalFixedLagSmootherExtWithFallback::calculateEstimate() const {
+  if (force_fallback_interval > 0 && fallback_happend.load()) {
+    return values;
+  }
+
   try {
     return smoother->calculateEstimate();
   } catch (std::exception& e) {
@@ -106,6 +110,10 @@ gtsam::Values IncrementalFixedLagSmootherExtWithFallback::calculateEstimate() co
 }
 
 const gtsam::Value& IncrementalFixedLagSmootherExtWithFallback::calculateEstimate(gtsam::Key key) const {
+  if (force_fallback_interval > 0 && fallback_happend.load()) {
+    return values.at(key);
+  }
+
   try {
     const auto& value = smoother->calculateEstimate(key);
     auto found = values.find(key);
@@ -283,6 +291,9 @@ void IncrementalFixedLagSmootherExtWithFallback::fallback_smoother() const {
 
   for (const auto& key : keys_to_remove) {
     values.erase(key);
+    if (original_values.exists(key)) {
+      original_values.erase(key);
+    }
     stamps.erase(key);
   }
 
@@ -337,6 +348,33 @@ void IncrementalFixedLagSmootherExtWithFallback::fallback_smoother() const {
     }
   };
 
+  const auto make_rebuild_values = [&] {
+    gtsam::Values rebuild_values;
+    const bool use_original = (force_fallback_interval > 0);
+
+    for (const auto& value : values) {
+      const auto original_itr = use_original ? original_values.find(value.key) : original_values.end();
+      if (original_itr != original_values.end()) {
+        rebuild_values.insert(value.key, original_itr->value);
+      } else {
+        rebuild_values.insert(value.key, value.value);
+      }
+    }
+
+    return rebuild_values;
+  };
+
+  const auto clone_factor_graph = [](const gtsam::NonlinearFactorGraph& source) {
+    gtsam::NonlinearFactorGraph cloned;
+    cloned.reserve(source.size());
+    for (const auto& factor : source) {
+      if (factor) {
+        cloned.add(factor->clone());
+      }
+    }
+    return cloned;
+  };
+
   // Create fixation factors
   for (const auto& value : values) {
     const gtsam::Symbol symbol(value.key);
@@ -388,7 +426,7 @@ void IncrementalFixedLagSmootherExtWithFallback::fallback_smoother() const {
 
   const auto rebuild_smoother = [&](const gtsam::NonlinearFactorGraph& rebuild_factors) {
     smoother.reset(new IncrementalFixedLagSmootherExt(smoother->smootherLag(), smoother->params()));
-    smoother->update(rebuild_factors, values, new_stamps);
+    smoother->update(clone_factor_graph(rebuild_factors), make_rebuild_values(), new_stamps);
   };
 
   try {

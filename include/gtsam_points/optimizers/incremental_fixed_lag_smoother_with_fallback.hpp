@@ -29,6 +29,10 @@ public:
 
   template <class VALUE>
   VALUE calculateEstimate(Key key) const {
+    if (force_fallback_interval > 0 && fallback_happend.load()) {
+      return values.at(key).cast<VALUE>();
+    }
+
     try {
       const VALUE value = smoother->calculateEstimate<VALUE>(key);
       auto found = values.find(key);
