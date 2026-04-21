@@ -24,7 +24,12 @@ public:
   /// @brief Check if the cell is occupied.
   /// @param coord Coordinate of the cell.
   /// @return True if the cell is occupied.
-  bool occupied(const Eigen::Vector3i& coord) const { return cells[cell_index(coord)]; }
+  bool occupied(const Eigen::Vector3i& coord) const {
+    if (!valid_cell_coord(coord)) {
+      return false;
+    }
+    return cells[cell_index(coord)];
+  }
 
   /// @brief Check if the cell is free.
   /// @param coord Coordinate of the cell.
@@ -33,15 +38,28 @@ public:
 
   /// @brief Set the cell as occupied.
   /// @param coord Coordinate of the cell.
-  void set_occupied(const Eigen::Vector3i& coord) { cells.set(cell_index(coord)); }
+  void set_occupied(const Eigen::Vector3i& coord) {
+    if (!valid_cell_coord(coord)) {
+      return;
+    }
+    cells.set(cell_index(coord));
+  }
 
   /// @brief Set the cell as free.
   /// @param coord Coordinate of the cell.
-  void set_free(const Eigen::Vector3i& coord) { cells.reset(cell_index(coord)); }
+  void set_free(const Eigen::Vector3i& coord) {
+    if (!valid_cell_coord(coord)) {
+      return;
+    }
+    cells.reset(cell_index(coord));
+  }
 
   /// @brief  Count the number of occupied cells.
   /// @return Number of occupied cells.
   int count() const { return cells.count(); }
+
+private:
+  bool valid_cell_coord(const Eigen::Vector3i& coord) const { return (coord.array() >= 0).all() && (coord.array() < stride).all(); }
 
 public:
   std::bitset<num_cells> cells;  ///< Occupancy status of each cell in the block.
@@ -100,6 +118,8 @@ private:
   std::uint64_t find_or_insert_block(std::uint64_t block_index);
 
   void rehash(size_t hash_size);
+
+  bool quantize(const Eigen::Vector4d& pt, const Eigen::Isometry3d& pose, Eigen::Array4i& global_coord, Eigen::Array4i& block_coord) const;
 
 private:
   static constexpr std::uint64_t INVALID_INDEX = std::numeric_limits<std::uint64_t>::max();
