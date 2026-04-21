@@ -15,8 +15,11 @@ template <typename PointCloud>
 void FastOccupancyGrid::insert(const PointCloud& points, const Eigen::Isometry3d& pose) {
   for (int i = 0; i < frame::size(points); i++) {
     const auto& pt = frame::point(points, i);
-    const Eigen::Array4i global_coord = fast_floor((pose * pt) * inv_resolution) + coord_offset;
-    const Eigen::Array4i block_coord = global_coord / FastOccupancyBlock::stride;
+    Eigen::Array4i global_coord;
+    Eigen::Array4i block_coord;
+    if (!quantize(pt, pose, global_coord, block_coord)) {
+      continue;
+    }
     const Eigen::Array4i cell_coord = global_coord - block_coord * FastOccupancyBlock::stride;
 
     const std::uint64_t block_index = calc_index(block_coord);
@@ -30,8 +33,11 @@ int FastOccupancyGrid::calc_overlap(const PointCloud& points, const Eigen::Isome
   int num_overlap = 0;
   for (int i = 0; i < frame::size(points); i++) {
     const auto& pt = frame::point(points, i);
-    const Eigen::Array4i global_coord = fast_floor((pose * pt) * inv_resolution) + coord_offset;
-    const Eigen::Array4i block_coord = global_coord / FastOccupancyBlock::stride;
+    Eigen::Array4i global_coord;
+    Eigen::Array4i block_coord;
+    if (!quantize(pt, pose, global_coord, block_coord)) {
+      continue;
+    }
 
     const std::uint64_t block_index = calc_index(block_coord);
     const std::uint64_t block_loc = find_block(block_index);
@@ -57,8 +63,11 @@ std::vector<unsigned char> FastOccupancyGrid::get_overlaps(const PointCloud& poi
 
   for (int i = 0; i < frame::size(points); i++) {
     const auto& pt = frame::point(points, i);
-    const Eigen::Array4i global_coord = fast_floor((pose * pt) * inv_resolution) + coord_offset;
-    const Eigen::Array4i block_coord = global_coord / FastOccupancyBlock::stride;
+    Eigen::Array4i global_coord;
+    Eigen::Array4i block_coord;
+    if (!quantize(pt, pose, global_coord, block_coord)) {
+      continue;
+    }
 
     const std::uint64_t block_index = calc_index(block_coord);
     const std::uint64_t block_loc = find_block(block_index);

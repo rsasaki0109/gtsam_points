@@ -16,6 +16,26 @@ FastOccupancyGrid::FastOccupancyGrid(double resolution)
 
 FastOccupancyGrid::~FastOccupancyGrid() {}
 
+bool FastOccupancyGrid::quantize(
+  const Eigen::Vector4d& pt,
+  const Eigen::Isometry3d& pose,
+  Eigen::Array4i& global_coord,
+  Eigen::Array4i& block_coord) const {
+  const Eigen::Array4d transed = ((pose * pt) * inv_resolution).array();
+  constexpr int coord_offset_i = static_cast<int>(coord_offset);
+  const Eigen::Array3d transed_head = transed.head<3>();
+  if (!transed_head.isFinite().all() ||
+      (transed_head < -coord_offset_i).any() ||
+      (transed_head >= coord_offset_i).any()) {
+    return false;
+  }
+
+  const Eigen::Array4i raw_coord = fast_floor(transed);
+  global_coord = raw_coord + coord_offset_i;
+  block_coord = global_coord / FastOccupancyBlock::stride;
+  return true;
+}
+
 int FastOccupancyGrid::num_occupied_cells() const {
   return std::accumulate(blocks.begin(), blocks.end(), 0, [](int sum, const auto& block) { return sum + block.second.count(); });
 }

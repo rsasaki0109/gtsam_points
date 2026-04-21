@@ -10,6 +10,7 @@
 #include <gtsam/nonlinear/LinearContainerFactor.h>
 
 #include <gtsam/geometry/Pose3.h>
+#include <gtsam/navigation/ImuBias.h>
 #include <gtsam/slam/PriorFactor.h>
 #include <gtsam_points/factors/linear_damping_factor.hpp>
 
@@ -40,6 +41,11 @@ IncrementalFixedLagSmootherExtWithFallback::Result IncrementalFixedLagSmootherEx
   }
 
   values.insert(newTheta);
+  for (const auto& key_val : newTheta) {
+    if (!original_values.exists(key_val.key)) {
+      original_values.insert(key_val.key, key_val.value);
+    }
+  }
   for (auto& stamp : timestamps) {
     stamps[stamp.first] = stamp.second;
     current_stamp = std::max(current_stamp, stamp.second);
@@ -47,22 +53,45 @@ IncrementalFixedLagSmootherExtWithFallback::Result IncrementalFixedLagSmootherEx
 
   Result result;
 
-  try {
-    result = smoother->update(newFactors, newTheta, timestamps, factorsToRemove);
-  } catch (std::exception& e) {
-    std::cerr << "warning: an exception was caught in fixed-lag smoother update!!" << std::endl;
-    std::cerr << "       : " << e.what() << std::endl;
+  const bool should_force_fallback =
+    force_fallback_interval > 0 && update_count > 0 && (update_count % force_fallback_interval == 0);
 
+  if (should_force_fallback) {
     fallback_smoother();
-    result = smoother->update();
+    try {
+      result = smoother->update();
+    } catch (std::exception& fallback_error) {
+      std::cerr << "warning: forced-fallback smoother update failed, keeping cached values!!" << std::endl;
+      std::cerr << "       : " << fallback_error.what() << std::endl;
+    }
+  } else {
+    try {
+      result = smoother->update(newFactors, newTheta, timestamps, factorsToRemove);
+    } catch (std::exception& e) {
+      std::cerr << "warning: an exception was caught in fixed-lag smoother update!!" << std::endl;
+      std::cerr << "       : " << e.what() << std::endl;
+
+      fallback_smoother();
+      try {
+        result = smoother->update();
+      } catch (std::exception& fallback_error) {
+        std::cerr << "warning: post-fallback smoother update still failed, keeping cached values!!" << std::endl;
+        std::cerr << "       : " << fallback_error.what() << std::endl;
+      }
+    }
   }
 
+  ++update_count;
   update_fallback_state();
 
   return result;
 }
 
 gtsam::Values IncrementalFixedLagSmootherExtWithFallback::calculateEstimate() const {
+  if (force_fallback_interval > 0 && fallback_happend.load()) {
+    return values;
+  }
+
   try {
     return smoother->calculateEstimate();
   } catch (std::exception& e) {
@@ -70,11 +99,21 @@ gtsam::Values IncrementalFixedLagSmootherExtWithFallback::calculateEstimate() co
     std::cerr << "       : " << e.what() << std::endl;
 
     fallback_smoother();
-    return smoother->calculateEstimate();
+    try {
+      return smoother->calculateEstimate();
+    } catch (std::exception& fallback_error) {
+      std::cerr << "warning: fallback calculateEstimate still failed, using cached values!!" << std::endl;
+      std::cerr << "       : " << fallback_error.what() << std::endl;
+      return values;
+    }
   }
 }
 
 const gtsam::Value& IncrementalFixedLagSmootherExtWithFallback::calculateEstimate(gtsam::Key key) const {
+  if (force_fallback_interval > 0 && fallback_happend.load()) {
+    return values.at(key);
+  }
+
   try {
     const auto& value = smoother->calculateEstimate(key);
     auto found = values.find(key);
@@ -88,7 +127,13 @@ const gtsam::Value& IncrementalFixedLagSmootherExtWithFallback::calculateEstimat
     std::cerr << "       : " << e.what() << std::endl;
 
     fallback_smoother();
-    return smoother->calculateEstimate(key);
+    try {
+      return smoother->calculateEstimate(key);
+    } catch (std::exception& fallback_error) {
+      std::cerr << "warning: fallback calculateEstimate(key) still failed, using cached value!!" << std::endl;
+      std::cerr << "       : " << fallback_error.what() << std::endl;
+      return values.at(key);
+    }
   }
 }
 
@@ -119,6 +164,9 @@ void IncrementalFixedLagSmootherExtWithFallback::update_fallback_state() {
     }
 
     values.erase(key);
+    if (original_values.exists(key)) {
+      original_values.erase(key);
+    }
   }
 
   for (auto itr = stamps.begin(); itr != stamps.end();) {
@@ -243,6 +291,9 @@ void IncrementalFixedLagSmootherExtWithFallback::fallback_smoother() const {
 
   for (const auto& key : keys_to_remove) {
     values.erase(key);
+    if (original_values.exists(key)) {
+      original_values.erase(key);
+    }
     stamps.erase(key);
   }
 
@@ -262,6 +313,68 @@ void IncrementalFixedLagSmootherExtWithFallback::fallback_smoother() const {
   }
   this->factors = new_factors;
 
+  const auto add_fixation_factor = [&](gtsam::NonlinearFactorGraph& graph, const gtsam::Values::ConstKeyValuePair& value, const std::pair<char, int>& var_type) {
+    // When the force-fallback cadence is enabled, switch the fixation target to original_values
+    // (schedule-independent snapshot of input theta). This prevents timing-dependent mutations of
+    // `values` by calculateEstimate(key) from leaking into the fallback result and makes successive
+    // fallbacks reproducible. When force-fallback is off, keep the legacy behavior (value.value)
+    // for backward compatibility — callers that trigger only on actual ILS throws expect the
+    // fixation target to track the current optimizer estimate.
+    const bool use_original = (force_fallback_interval > 0);
+    const auto original_itr = use_original ? original_values.find(value.key) : original_values.end();
+    const gtsam::Value& fixation_value = (original_itr != original_values.end()) ? original_itr->value : value.value;
+    switch (var_type.second) {
+      case 0:
+        graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+          value.key,
+          fixation_value.cast<gtsam::Pose3>(),
+          gtsam::noiseModel::Isotropic::Precision(6, 1e6));
+        break;
+      case 1:
+        graph.emplace_shared<gtsam::PriorFactor<gtsam::Vector3>>(
+          value.key,
+          fixation_value.cast<gtsam::Vector3>(),
+          gtsam::noiseModel::Isotropic::Precision(3, 1e6));
+        break;
+      case 2:
+        graph.emplace_shared<gtsam::PriorFactor<gtsam::imuBias::ConstantBias>>(
+          value.key,
+          fixation_value.cast<gtsam::imuBias::ConstantBias>(),
+          gtsam::noiseModel::Isotropic::Precision(6, 1e6));
+        break;
+      default:
+        std::cerr << "error: unknown variable type!! (chr=" << static_cast<int>(var_type.first) << " type=" << var_type.second << ")" << std::endl;
+        break;
+    }
+  };
+
+  const auto make_rebuild_values = [&] {
+    gtsam::Values rebuild_values;
+    const bool use_original = (force_fallback_interval > 0);
+
+    for (const auto& value : values) {
+      const auto original_itr = use_original ? original_values.find(value.key) : original_values.end();
+      if (original_itr != original_values.end()) {
+        rebuild_values.insert(value.key, original_itr->value);
+      } else {
+        rebuild_values.insert(value.key, value.value);
+      }
+    }
+
+    return rebuild_values;
+  };
+
+  const auto clone_factor_graph = [](const gtsam::NonlinearFactorGraph& source) {
+    gtsam::NonlinearFactorGraph cloned;
+    cloned.reserve(source.size());
+    for (const auto& factor : source) {
+      if (factor) {
+        cloned.add(factor->clone());
+      }
+    }
+    return cloned;
+  };
+
   // Create fixation factors
   for (const auto& value : values) {
     const gtsam::Symbol symbol(value.key);
@@ -278,24 +391,7 @@ void IncrementalFixedLagSmootherExtWithFallback::fallback_smoother() const {
     for (const auto var_type : fix_variable_types) {
       if (symbol.chr() == var_type.first) {
         std::cout << "fixing " << symbol << std::endl;
-        switch (var_type.second) {
-          case 0:
-            new_factors.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
-              value.key,
-              value.value.cast<gtsam::Pose3>(),
-              gtsam::noiseModel::Isotropic::Precision(6, 1e6));
-            break;
-          case 1:
-            new_factors.emplace_shared<gtsam::PriorFactor<gtsam::Vector3>>(
-              value.key,
-              value.value.cast<gtsam::Vector3>(),
-              gtsam::noiseModel::Isotropic::Precision(3, 1e6));
-            break;
-          default:
-            std::cerr << "error: unknown variable type!! (chr=" << static_cast<int>(var_type.first) << " type=" << var_type.second << ")"
-                      << std::endl;
-            break;
-        }
+        add_fixation_factor(new_factors, value, var_type);
       }
     }
   }
@@ -328,8 +424,56 @@ void IncrementalFixedLagSmootherExtWithFallback::fallback_smoother() const {
     }
   }
 
-  smoother.reset(new IncrementalFixedLagSmootherExt(smoother->smootherLag(), smoother->params()));
-  smoother->update(new_factors, values, new_stamps);
+  const auto rebuild_smoother = [&](const gtsam::NonlinearFactorGraph& rebuild_factors) {
+    smoother.reset(new IncrementalFixedLagSmootherExt(smoother->smootherLag(), smoother->params()));
+    smoother->update(clone_factor_graph(rebuild_factors), make_rebuild_values(), new_stamps);
+  };
+
+  try {
+    rebuild_smoother(new_factors);
+  } catch (const std::exception& e) {
+    std::cerr << "warning: fallback smoother rebuild failed, retrying with full fixation!!" << std::endl;
+    std::cerr << "       : " << e.what() << std::endl;
+
+    gtsam::NonlinearFactorGraph fully_fixed_factors = new_factors;
+    for (const auto& value : values) {
+      const gtsam::Symbol symbol(value.key);
+      for (const auto& var_type : fix_variable_types) {
+        if (symbol.chr() == var_type.first) {
+          add_fixation_factor(fully_fixed_factors, value, var_type);
+        }
+      }
+    }
+
+    try {
+      rebuild_smoother(fully_fixed_factors);
+    } catch (const std::exception& final_error) {
+      std::cerr << "warning: fallback smoother rebuild still failed, retrying with cache-only fixation!!" << std::endl;
+      std::cerr << "       : " << final_error.what() << std::endl;
+
+      gtsam::NonlinearFactorGraph cache_only_factors;
+      cache_only_factors.reserve(values.size() * (fix_variable_types.size() + 1));
+      for (const auto& value : values) {
+        const gtsam::Symbol symbol(value.key);
+        const int dim = value.value.dim();
+        cache_only_factors.emplace_shared<gtsam_points::LinearDampingFactor>(value.key, dim, 1e6);
+
+        for (const auto& var_type : fix_variable_types) {
+          if (symbol.chr() == var_type.first) {
+            add_fixation_factor(cache_only_factors, value, var_type);
+          }
+        }
+      }
+
+      try {
+        rebuild_smoother(cache_only_factors);
+      } catch (const std::exception& cache_only_error) {
+        std::cerr << "warning: cache-only fallback smoother rebuild still failed, leaving empty smoother and using cached values!!" << std::endl;
+        std::cerr << "       : " << cache_only_error.what() << std::endl;
+        smoother.reset(new IncrementalFixedLagSmootherExt(smoother->smootherLag(), smoother->params()));
+      }
+    }
+  }
 }
 
 }  // namespace gtsam_points
